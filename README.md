@@ -1,6 +1,6 @@
 # zssh
 
-用 macOS 钥匙串保存 SSH 密码、通过系统 `ssh` 执行远程命令的小工具，适合交给 Claude Code 等 AI Agent 使用：Agent 只传主机别名，密码由钥匙串经 `SSH_ASKPASS` 直接交给 `ssh`，不出现在命令行参数、环境变量、输出和会话记录中。
+用 macOS 钥匙串（或 Windows 凭据管理器）保存 SSH 密码、通过系统 `ssh` 执行远程命令的小工具，适合交给 Claude Code 等 AI Agent 使用：Agent 只传主机别名，密码由钥匙串经 `SSH_ASKPASS` 直接交给 `ssh`，不出现在命令行参数、环境变量、输出和会话记录中。
 
 ## 工作原理
 
@@ -46,13 +46,36 @@ security delete-generic-password -s ssh_pass_web01 -a web01
 # 再手动删除 ~/.ssh/config 中对应的 Host 段
 ```
 
+## Windows 版
+
+`windows/` 目录是 Git Bash 版本（Claude Code 在 Windows 上的 Bash 工具即 Git Bash），用法与 macOS 版相同：
+
+| | macOS 版 `bin/zssh` | Windows 版 `windows/zssh` |
+|---|---|---|
+| 密码存放 | 钥匙串，service `ssh_pass_<alias>` | 凭据管理器 → Windows 凭据（普通凭据），目标名 `ssh_pass_<alias>` |
+| 读写方式 | `/usr/bin/security` | 同目录的 `zssh-cred.ps1`（Windows PowerShell 调用 `CredRead/CredWrite`，无需额外模块） |
+| ssh | `/usr/bin/ssh` | Git Bash 自带的 `/usr/bin/ssh`（不是 `C:\Windows\System32\OpenSSH`） |
+| 连接复用 | ControlMaster 10 分钟 | 无（Git Bash 下 ControlMaster 不可靠），每次调用单独连接 |
+
+安装（在 Git Bash 中执行）：
+
+```bash
+git clone https://github.com/zcw199604/zssh.git ~/project/zssh
+echo 'export PATH="$HOME/project/zssh/windows:$PATH"' >> ~/.bashrc && source ~/.bashrc
+cp -r ~/project/zssh/skills/zssh ~/.claude/skills/zssh   # 可选：安装 Claude Code skill
+```
+
+删除凭据：`MSYS_NO_PATHCONV=1 cmdkey /delete:ssh_pass_<alias>`，或在「控制面板 → 凭据管理器 → Windows 凭据」中删除。
+
+要求：Git for Windows（自带 OpenSSH ≥ 8.4）和系统自带的 Windows PowerShell 5.1。
+
 ## Claude Code skill
 
 `skills/zssh/SKILL.md` 约定 Agent 统一通过 `zssh <alias> '<cmd>'` 访问远程主机，不读写钥匙串、不运行 `zssh --set`，认证失败或主机指纹变化时停止并报告，变更类命令执行前先征得用户确认。
 
 ## 安全说明
 
-- 默认情况下，以同一用户身份运行的任何程序都能读取由 `security` 创建的钥匙串条目，Agent 理论上也可以直接调用 `security` 读出密码；skill 的约束只是提示词层面的。
+- 默认情况下，以同一用户身份运行的任何程序都能读取由 `security` 创建的钥匙串条目，Agent 理论上也可以直接调用 `security` 读出密码；skill 的约束只是提示词层面的。Windows 凭据管理器同理，且没有逐次弹窗确认的选项。
 - 如需人工把关，录入时去掉对 `security` 的默认信任，让每次读取都弹窗确认（连接复用期内不会重复弹出）：
 
   ```bash

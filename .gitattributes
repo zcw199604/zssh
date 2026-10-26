@@ -1,0 +1,5 @@
+# Windows 上 core.autocrlf=true 会把脚本转成 CRLF，导致 bash 报 $'\r'，这里固定为 LF
+bin/zssh text eol=lf
+windows/zssh text eol=lf
+windows/zssh-cred.ps1 text eol=crlf
+*.md text eol=lf
