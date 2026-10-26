@@ -4,13 +4,19 @@
 #   zssh --add <alias> <user@host[:port]>  在 ~/.ssh/config 追加主机别名，并可接着录入密码
 #   zssh --set <alias>                     录入/更新该别名的密码（交互输入，仅限人工在终端执行）
 #   zssh --probe <alias>                   只握手不登录，检查老服务器需要补哪些算法配置
+#   zssh -t <alias> [remote command]       交互式登录（或运行需要终端的命令），仅限人工在终端使用
+#   zssh --put <alias> <local> <remote>    上传文件或目录（scp -r）
+#   zssh --get <alias> <remote> <local>    下载文件或目录（scp -r）
+#   zssh --forward <alias> <[bind:]port:host:hostport>  本地端口转发（ssh -L），Ctrl-C 结束，仅限人工在终端使用
 set -eu
 
 # 凭据管理器中的普通凭据：目标名 ssh_pass_<alias>，用户名 alias；读写由同目录的 zssh-cred.ps1 完成
 TARGET_PREFIX=ssh_pass_
 SSH=/usr/bin/ssh
+SCP=/usr/bin/scp
 SSH_CONFIG="$HOME/.ssh/config"
 script_dir=$(cd "$(dirname "$0")" && pwd)
+self="$script_dir/$(basename "$0")"
 
 cred() {
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
@@ -26,7 +32,7 @@ if [ -n "${ZSSH_ASKPASS_ALIAS:-}" ]; then
 fi
 
 usage() {
-    sed -n '3,6p' "$0" >&2
+    sed -n '3,10p' "$0" >&2
     exit 2
 }
 
@@ -191,11 +197,74 @@ probe_host() {
     printf '%s' "$suggestions" | sed 's/^/    /'
 }
 
+# 用凭据管理器中的密码（如有）执行 ssh/scp 并替换当前进程；Git Bash 下 ControlMaster 不可靠，不做连接复用
+#   $1 程序；$2 为 1 时允许用户自己回答提示；其余为参数
+exec_with_auth() {
+    tool=$1
+    allow_prompt=$2
+    shift 2
+    set -- -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 "$@"
+    # 允许人工回答提示且凭据管理器里没有该别名的密码：交给原生程序，提示由用户自己输入
+    if [ "$allow_prompt" = 1 ] && ! cred get "$alias_name" >/dev/null 2>&1; then
+        exec "$tool" "$@"
+    fi
+    # 挂上 askpass：密钥认证成功时不会回调；需要密码时从凭据管理器读取，没有该凭据则认证失败，不会卡住
+    ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec "$tool" "$@"
+}
+
+# 盘符路径转成 Git Bash 路径；scp 会把其他含冒号的本地路径当成远程地址，加 ./ 前缀避免误判
+local_path() {
+    case "$1" in
+        [A-Za-z]:[\\/]*) cygpath -u "$1" ;;
+        /* | ./* | ../*) echo "$1" ;;
+        *:*) echo "./$1" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# $1 为 put 或 get，$2 别名，$3 源路径，$4 目标路径；scp -r 同时适用于文件和目录
+transfer() {
+    alias_name=$2
+    check_alias "$alias_name"
+    if [ "$1" = put ]; then
+        src=$(local_path "$3")
+        [ -e "$src" ] || die "本地路径不存在: $3"
+        dst="$alias_name:$4"
+    else
+        src="$alias_name:$3"
+        dst=$(local_path "$4")
+    fi
+    prompt=0
+    [ ! -t 0 ] || prompt=1
+    exec_with_auth "$SCP" "$prompt" -r "$src" "$dst"
+}
+
+forward() {
+    alias_name=$1
+    check_alias "$alias_name"
+    case "$2" in
+        -* | *[!A-Za-z0-9._:-]*) die "转发规则格式应为 [bind:]port:host:hostport: $2" ;;
+        *:*:*) ;;
+        *) die "转发规则格式应为 [bind:]port:host:hostport: $2" ;;
+    esac
+    [ -t 0 ] || die "--forward 会一直运行直到 Ctrl-C，需要在终端中使用"
+    echo "经 $alias_name 建立本地端口转发 $2，Ctrl-C 结束" >&2
+    exec_with_auth "$SSH" 1 -N -o ExitOnForwardFailure=yes -L "$2" "$alias_name"
+}
+
 case "${1:-}" in
     --set)
         [ $# -eq 2 ] || usage
         set_password "$2"
         exit 0
+        ;;
+    --put | --get)
+        [ $# -eq 4 ] || usage
+        transfer "${1#--}" "$2" "$3" "$4"
+        ;;
+    --forward)
+        [ $# -eq 3 ] || usage
+        forward "$2" "$3"
         ;;
     --add)
         [ $# -eq 3 ] || usage
@@ -207,16 +276,19 @@ case "${1:-}" in
         probe_host "$2"
         exit 0
         ;;
+    -t)
+        [ $# -ge 2 ] || usage
+        [ -t 0 ] || die "-t 需要在终端中使用；非交互调用请去掉 -t 并提供远程命令"
+        interactive=1
+        shift
+        ;;
     '' | -*) usage ;;
 esac
-[ $# -ge 2 ] || usage
+[ -n "${interactive:-}" ] || [ $# -ge 2 ] || usage
 
 alias_name=$1
 shift
 check_alias "$alias_name"
 
-# 始终挂上 askpass：密钥认证成功时不会回调；需要密码时从凭据管理器读取，没有该凭据则认证失败，不会卡住。
-# Git Bash 下 ControlMaster 不可靠，因此不做连接复用。
-ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS="$script_dir/$(basename "$0")" SSH_ASKPASS_REQUIRE=force \
-    exec "$SSH" -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
-    "$alias_name" "$@"
+# -t 时分配终端，无凭据则提示交给用户
+exec_with_auth "$SSH" "${interactive:-0}" ${interactive:+-t} "$alias_name" "$@"

@@ -4,13 +4,20 @@
 #   zssh --add <alias> <user@host[:port]>  在 ~/.ssh/config 追加主机别名，并可接着录入密码
 #   zssh --set <alias>                     录入/更新该别名的密码（交互输入，仅限人工在终端执行）
 #   zssh --probe <alias>                   只握手不登录，检查老服务器需要补哪些算法配置
+#   zssh -t <alias> [remote command]       交互式登录（或运行需要终端的命令），仅限人工在终端使用
+#   zssh --put <alias> <local> <remote>    上传文件或目录（scp -r）
+#   zssh --get <alias> <remote> <local>    下载文件或目录（scp -r）
+#   zssh --forward <alias> <[bind:]port:host:hostport>  本地端口转发（ssh -L），Ctrl-C 结束，仅限人工在终端使用
 set -eu
 
 # 钥匙串条目：service 为 ssh_pass_<alias>，account 为 alias
 SERVICE_PREFIX=ssh_pass_
 SECURITY=/usr/bin/security
 SSH=/usr/bin/ssh
+SCP=/usr/bin/scp
 SSH_CONFIG="$HOME/.ssh/config"
+CONTROL_PATH="$HOME/.ssh/zssh-%C"
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 # 被 ssh 作为 SSH_ASKPASS 回调时：只应答密码提示，主机指纹确认等其他提示一律拒绝
 if [ -n "${ZSSH_ASKPASS_ALIAS:-}" ]; then
@@ -21,7 +28,7 @@ if [ -n "${ZSSH_ASKPASS_ALIAS:-}" ]; then
 fi
 
 usage() {
-    sed -n '3,6p' "$0" >&2
+    sed -n '3,10p' "$0" >&2
     exit 2
 }
 
@@ -182,10 +189,73 @@ probe_host() {
     printf '%s' "$suggestions" | sed 's/^/    /'
 }
 
+# 用钥匙串中的密码（如有）执行 ssh/scp 并替换当前进程
+#   $1 程序；$2 为 1 时允许用户自己回答提示（无钥匙串密码时不加 BatchMode）；其余为参数
+exec_with_auth() {
+    tool=$1
+    allow_prompt=$2
+    shift 2
+    set -- -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 "$@"
+    if "$SECURITY" find-generic-password -s "$SERVICE_PREFIX$alias_name" -a "$alias_name" >/dev/null 2>&1; then
+        ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec "$tool" "$@"
+    fi
+    [ "$allow_prompt" = 1 ] || set -- -o BatchMode=yes "$@"
+    exec "$tool" "$@"
+}
+
+# scp 会把含冒号的本地路径当成远程地址，加 ./ 前缀避免误判
+local_path() {
+    case "$1" in
+        /* | ./* | ../*) echo "$1" ;;
+        *:*) echo "./$1" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# $1 为 put 或 get，$2 别名，$3 源路径，$4 目标路径；scp -r 同时适用于文件和目录
+transfer() {
+    alias_name=$2
+    check_alias "$alias_name"
+    if [ "$1" = put ]; then
+        [ -e "$3" ] || die "本地路径不存在: $3"
+        src=$(local_path "$3")
+        dst="$alias_name:$4"
+    else
+        src="$alias_name:$3"
+        dst=$(local_path "$4")
+    fi
+    prompt=0
+    [ ! -t 0 ] || prompt=1
+    exec_with_auth "$SCP" "$prompt" -r \
+        -o ControlMaster=auto -o ControlPath="$CONTROL_PATH" -o ControlPersist=10m "$src" "$dst"
+}
+
+forward() {
+    alias_name=$1
+    check_alias "$alias_name"
+    case "$2" in
+        -* | *[!A-Za-z0-9._:-]*) die "转发规则格式应为 [bind:]port:host:hostport: $2" ;;
+        *:*:*) ;;
+        *) die "转发规则格式应为 [bind:]port:host:hostport: $2" ;;
+    esac
+    [ -t 0 ] || die "--forward 会一直运行直到 Ctrl-C，需要在终端中使用"
+    echo "经 $alias_name 建立本地端口转发 $2，Ctrl-C 结束" >&2
+    # 单独建连（不走 ControlMaster），避免转发挂在共享连接上、退出后仍残留
+    exec_with_auth "$SSH" 1 -N -o ExitOnForwardFailure=yes -o ControlPath=none -L "$2" "$alias_name"
+}
+
 case "${1:-}" in
     --set)
         [ $# -eq 2 ] || usage
         set_password "$2"
+        ;;
+    --put | --get)
+        [ $# -eq 4 ] || usage
+        transfer "${1#--}" "$2" "$3" "$4"
+        ;;
+    --forward)
+        [ $# -eq 3 ] || usage
+        forward "$2" "$3"
         ;;
     --add)
         [ $# -eq 3 ] || usage
@@ -197,20 +267,21 @@ case "${1:-}" in
         probe_host "$2"
         exit 0
         ;;
+    -t)
+        [ $# -ge 2 ] || usage
+        [ -t 0 ] || die "-t 需要在终端中使用；非交互调用请去掉 -t 并提供远程命令"
+        interactive=1
+        shift
+        ;;
     '' | -*) usage ;;
 esac
-[ $# -ge 2 ] || usage
+[ -n "${interactive:-}" ] || [ $# -ge 2 ] || usage
 
 alias_name=$1
 shift
-self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+check_alias "$alias_name"
 
-set -- -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
-    -o ControlMaster=auto -o ControlPath="$HOME/.ssh/zssh-%C" -o ControlPersist=10m \
-    "$alias_name" "$@"
-
-# 钥匙串有该别名的密码 → askpass 方式；否则按密钥认证，且禁止任何交互提示
-if "$SECURITY" find-generic-password -s "$SERVICE_PREFIX$alias_name" -a "$alias_name" >/dev/null 2>&1; then
-    ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec "$SSH" "$@"
-fi
-exec "$SSH" -o BatchMode=yes "$@"
+# 非交互时禁止任何提示；-t 时分配终端，无钥匙串密码则提示交给用户
+exec_with_auth "$SSH" "${interactive:-0}" \
+    -o ControlMaster=auto -o ControlPath="$CONTROL_PATH" -o ControlPersist=10m \
+    ${interactive:+-t} "$alias_name" "$@"

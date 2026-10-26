@@ -31,7 +31,28 @@ zssh --add <alias> <user@host[:port]>   # 追加 ~/.ssh/config 的 Host 段，�
 zssh --set <alias>                      # 录入或更新密码（交互输入）
 zssh --probe <alias>                    # 只握手不登录，检查老服务器需要补哪些算法配置
 zssh <alias> '<remote command>'         # 执行远程命令，退出码即远程命令退出码；255 表示 ssh 自身失败
+zssh -t <alias> [remote command]        # 交互式登录（等同 ssh <alias>，自动填写密码），或运行 top/vim 等需要终端的命令
 ```
+
+`-t` 只能在终端中使用（无终端时直接报错，避免 Agent 误用）。存有密码时自动从钥匙串/凭据管理器填写；没有密码时与原生 `ssh -t` 相同，密钥口令、首次连接的指纹确认等提示由你自己输入。
+
+### 传文件
+
+```bash
+zssh --put <alias> <local> <remote>     # 上传文件或目录
+zssh --get <alias> <remote> <local>     # 下载文件或目录
+```
+
+基于 `scp -r`，文件和目录都适用，密码同样自动填写；macOS 上与 `zssh` 命令共用 ControlMaster 连接。本地路径含冒号时会自动加 `./` 前缀，Windows 版支持 `C:\...` 盘符路径。新版 scp 默认走 SFTP 协议，若老服务器禁用了 sftp 子系统导致失败，可改用管道：`zssh <alias> 'cat /path' > local`、`tar czf - dir | zssh <alias> 'tar xzf - -C /dest'`。
+
+### 端口转发
+
+```bash
+zssh --forward <alias> [bind:]port:host:hostport   # 等同 ssh -N -L，Ctrl-C 结束
+zssh --forward web01 15432:127.0.0.1:5432          # 本机 15432 → 远程主机上的 PostgreSQL
+```
+
+只能在终端中使用；单独建立连接（不走 ControlMaster），Ctrl-C 后转发即释放；本地端口被占用时直接失败退出（`ExitOnForwardFailure=yes`）。
 
 ### 连接老版本 SSH 服务器
 

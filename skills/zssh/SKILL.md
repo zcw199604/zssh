@@ -15,7 +15,9 @@ zssh <alias> '<remote command>'
 - 远程命令整体作为一个参数，用单引号包住；多条相关的只读检查可以用 `;` / `&&` 合并成一次调用。
 - 退出码就是远程命令的退出码；`255` 表示 ssh 自身失败（连接、认证、主机指纹）。
 - macOS 上连接会复用 10 分钟（ControlMaster），连续调用不会重复认证；Windows（Git Bash）版每次调用单独连接。
-- 传文件：读取用 `zssh host 'cat /path'`；小文件写入用 `cat local | zssh host 'cat > /path'`。大文件或目录交给用户处理。
+- 传文件（基于 `scp -r`，文件和目录都适用，退出码非 0 即失败）：
+  - 下载：`zssh --get <alias> <remote path> <local path>`，属于只读操作，可直接执行。
+  - 上传：`zssh --put <alias> <local path> <remote path>`，会创建或覆盖远程文件，属于变更操作，执行前先说明目标路径并等用户确认。
 
 ## 添加连接
 
@@ -29,6 +31,7 @@ zssh <alias> '<remote command>'
 
 - 不直接运行 `ssh`/`scp`/`sshpass` 去连接需要密码的主机。
 - 不读取、打印、创建或删除钥匙串/凭据管理器条目（`security find-generic-password`、`add-generic-password`、`cmdkey`、`zssh-cred.ps1` 等），不设置 `ZSSH_ASKPASS_ALIAS`、`SSH_ASKPASS`。
+- 不使用 `zssh -t`（交互式登录）和 `zssh --forward`（端口转发，会一直运行到 Ctrl-C），它们仅供用户在自己的终端使用，无终端时会直接报错。需要端口转发时，把命令给用户自己运行。
 - 不运行 `zssh --set`，也不在有终端输入的情况下运行 `zssh --add`。缺密码时，请用户在自己的终端执行 `zssh --set <alias>`。
 - 认证失败（`Permission denied`）或主机指纹变化（`REMOTE HOST IDENTIFICATION HAS CHANGED`）时不要重试、不要绕过，直接报告给用户。
 
