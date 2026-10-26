@@ -29,8 +29,31 @@ ln -sfn ~/project/zssh/skills/zssh ~/.claude/skills/zssh  # 可选：安装 Clau
 ```bash
 zssh --add <alias> <user@host[:port]>   # 追加 ~/.ssh/config 的 Host 段，并可接着录入密码
 zssh --set <alias>                      # 录入或更新密码（交互输入）
+zssh --probe <alias>                    # 只握手不登录，检查老服务器需要补哪些算法配置
 zssh <alias> '<remote command>'         # 执行远程命令，退出码即远程命令退出码；255 表示 ssh 自身失败
 ```
+
+### 连接老版本 SSH 服务器
+
+新版 OpenSSH 默认禁用了 `ssh-rsa`（SHA-1）等旧算法，连接 CentOS 6（OpenSSH 5.3）这类老服务器时会报 `no matching host key type found` 等错误。用 `--probe` 检查：
+
+```text
+$ zssh --probe old01
+目标: deploy@192.0.2.20:22  服务器: OpenSSH_5.3
+  主机密钥: 不可协商，需添加 HostKeyAlgorithms +ssh-rsa
+  密钥交换: 可协商 (diffie-hellman-group-exchange-sha256)
+  加密算法: 可协商 (aes128-ctr)
+  MAC: 可协商 (hmac-sha2-256)
+  注意: 服务器早于 OpenSSH 6.5，不支持 ed25519 密钥，密钥登录请使用 RSA 密钥
+
+请在 ~/.ssh/config（或其 Include 的文件）的 Host old01 段中手动加入：
+    HostKeyAlgorithms +ssh-rsa
+    PubkeyAcceptedAlgorithms +ssh-rsa   # 仅使用 RSA 密钥登录时需要
+```
+
+- 探测时使用 `PreferredAuthentications=none` 只完成握手、不尝试登录，`UserKnownHostsFile=/dev/null` 不写入 known_hosts，只打印需要补充的配置，不修改任何文件。
+- 按提示把配置手动加到对应的 Host 段，不要加到 `Host *`；带注释的项按需添加。
+- 服务器只提供 `ssh-dss` 时，OpenSSH 10 已无法连接，只能升级服务器。
 
 示例：
 

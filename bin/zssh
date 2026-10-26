@@ -3,11 +3,13 @@
 #   zssh <alias> '<remote command>'        在 ~/.ssh/config 中的主机别名上执行命令
 #   zssh --add <alias> <user@host[:port]>  在 ~/.ssh/config 追加主机别名，并可接着录入密码
 #   zssh --set <alias>                     录入/更新该别名的密码（交互输入，仅限人工在终端执行）
+#   zssh --probe <alias>                   只握手不登录，检查老服务器需要补哪些算法配置
 set -eu
 
 # 钥匙串条目：service 为 ssh_pass_<alias>，account 为 alias
 SERVICE_PREFIX=ssh_pass_
 SECURITY=/usr/bin/security
+SSH=/usr/bin/ssh
 SSH_CONFIG="$HOME/.ssh/config"
 
 # 被 ssh 作为 SSH_ASKPASS 回调时：只应答密码提示，主机指纹确认等其他提示一律拒绝
@@ -19,7 +21,7 @@ if [ -n "${ZSSH_ASKPASS_ALIAS:-}" ]; then
 fi
 
 usage() {
-    sed -n '3,5p' "$0" >&2
+    sed -n '3,6p' "$0" >&2
     exit 2
 }
 
@@ -80,6 +82,106 @@ add_host() {
     esac
 }
 
+# 逗号分隔列表 $1 中第一个也出现在列表 $2 中的算法（结果按 $1 的顺序）
+first_common() {
+    old_ifs=$IFS
+    IFS=,
+    for algo in $1; do
+        case ",$2," in
+            *",$algo,"*) IFS=$old_ifs; echo "$algo"; return 0 ;;
+        esac
+    done
+    IFS=$old_ifs
+    return 1
+}
+
+# 服务器在 KEXINIT 中提供的某类算法；有 ProxyJump 时取最后一次握手（即目标主机）
+peer_offer() {
+    printf '%s\n' "$probe_log" | sed -n '/peer server KEXINIT proposal/,/compression stoc/p' |
+        sed -n "s/^debug2: $1: //p" | tail -n 1
+}
+
+# ssh 实际协商出的算法：$1 为 "debug1: kex: " 之后的前缀，$2 为取第几个字段
+negotiated() {
+    printf '%s\n' "$probe_log" | sed -n "s/^debug1: kex: $1//p" | tail -n 1 | awk -v f="$2" '{ print $f }'
+}
+
+effective_option() {
+    printf '%s\n' "$effective" | awk -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# 只握手、不认证（PreferredAuthentications=none），不写 known_hosts，不复用连接
+probe_host() {
+    alias_name=$1
+    check_alias "$alias_name"
+    effective=$("$SSH" -G "$alias_name" 2>/dev/null) || die "无法解析别名: $alias_name"
+    probe_log=$("$SSH" -vv -o BatchMode=yes -o ConnectTimeout=10 -o ControlPath=none \
+        -o PreferredAuthentications=none -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+        "$alias_name" true </dev/null 2>&1) || true
+
+    version=$(printf '%s\n' "$probe_log" | sed -n 's/.*remote software version //p' | tail -n 1)
+    echo "目标: $(effective_option user)@$(effective_option hostname):$(effective_option port)  服务器: ${version:-未知}"
+    if [ -z "$(peer_offer 'host key algorithms')" ]; then
+        printf '%s\n' "$probe_log" | grep -v '^debug' | tail -n 5 >&2
+        die "未能完成握手，无法获取服务器算法"
+    fi
+
+    suggestions=
+    cipher=
+    for spec in '主机密钥|host key algorithms|hostkeyalgorithms|HostKeyAlgorithms|host key algorithm: |1' \
+        '密钥交换|KEX algorithms|kexalgorithms|KexAlgorithms|algorithm: |1' \
+        '加密算法|ciphers ctos|ciphers|Ciphers|client->server cipher: |1' \
+        'MAC|MACs ctos|macs|MACs|client->server cipher: |3'; do
+        label=${spec%%|*}; rest=${spec#*|}
+        debug_key=${rest%%|*}; rest=${rest#*|}
+        g_key=${rest%%|*}; rest=${rest#*|}
+        option=${rest%%|*}; rest=${rest#*|}
+        neg_prefix=${rest%%|*}; neg_field=${rest#*|}
+
+        # AEAD 加密算法自带完整性校验，不再协商 MAC
+        if [ "$option" = MACs ]; then
+            case "$cipher" in *gcm* | *chacha20*) echo "  $label: 随加密算法 $cipher 内置，无需协商"; continue ;; esac
+        fi
+        offer=$(peer_offer "$debug_key")
+        # 可协商时优先显示 ssh 实际选中的算法；需补充时按服务器偏好挑本机支持的第一个
+        if algo=$(first_common "$(effective_option "$g_key")" "$offer"); then
+            actual=$(negotiated "$neg_prefix" "$neg_field")
+            algo=${actual:-$algo}
+            echo "  $label: 可协商 ($algo)"
+        elif algo=$(first_common "$offer" "$("$SSH" -Q "$option" | tr '\n' ',')"); then
+            echo "  $label: 不可协商，需添加 $option +$algo"
+            suggestions="$suggestions$option +$algo
+"
+        else
+            echo "  $label: 本机 ssh 已不支持服务器提供的任何算法 ($offer)，只能升级服务器的 SSH"
+        fi
+        if [ "$option" = Ciphers ]; then
+            cipher=${algo:-}
+        fi
+    done
+
+    # 7.2 以前的 OpenSSH 只认 ssh-rsa（SHA-1）签名的 RSA 公钥；6.5 以前不认识 ed25519
+    ver=$(printf '%s\n' "$version" | sed -n 's/^OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+    if [ -n "$ver" ]; then
+        ver_num=$((${ver% *} * 100 + ${ver#* }))
+        if [ "$ver_num" -lt 702 ] && ! first_common ssh-rsa "$(effective_option pubkeyacceptedalgorithms)" >/dev/null; then
+            suggestions="${suggestions}PubkeyAcceptedAlgorithms +ssh-rsa   # 仅使用 RSA 密钥登录时需要
+"
+        fi
+        if [ "$ver_num" -lt 605 ]; then
+            echo "  注意: 服务器早于 OpenSSH 6.5，不支持 ed25519 密钥，密钥登录请使用 RSA 密钥"
+        fi
+    fi
+
+    echo
+    if [ -z "$suggestions" ]; then
+        echo "当前配置可以与该服务器完成协商，无需修改。"
+        return 0
+    fi
+    echo "请在 ~/.ssh/config（或其 Include 的文件）的 Host $alias_name 段中手动加入："
+    printf '%s' "$suggestions" | sed 's/^/    /'
+}
+
 case "${1:-}" in
     --set)
         [ $# -eq 2 ] || usage
@@ -88,6 +190,11 @@ case "${1:-}" in
     --add)
         [ $# -eq 3 ] || usage
         add_host "$2" "$3"
+        exit 0
+        ;;
+    --probe)
+        [ $# -eq 2 ] || usage
+        probe_host "$2"
         exit 0
         ;;
     '' | -*) usage ;;
@@ -104,6 +211,6 @@ set -- -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o Conne
 
 # 钥匙串有该别名的密码 → askpass 方式；否则按密钥认证，且禁止任何交互提示
 if "$SECURITY" find-generic-password -s "$SERVICE_PREFIX$alias_name" -a "$alias_name" >/dev/null 2>&1; then
-    ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec /usr/bin/ssh "$@"
+    ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec "$SSH" "$@"
 fi
-exec /usr/bin/ssh -o BatchMode=yes "$@"
+exec "$SSH" -o BatchMode=yes "$@"

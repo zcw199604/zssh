@@ -21,6 +21,10 @@ zssh <alias> '<remote command>'
 
 用户要求添加主机时可以执行 `zssh --add <alias> <user@host[:port]> </dev/null`：它只追加 `~/.ssh/config`，别名已存在会拒绝；无终端时自动跳过录入密码。之后请用户在自己的终端执行 `zssh --set <alias>` 录入密码（钥匙串/凭据管理器中的条目名为 `ssh_pass_<alias>`）。
 
+## 连接失败排查
+
+出现 `no matching host key type / key exchange method / cipher found` 等协商失败时，执行 `zssh --probe <alias>`：它只握手不登录、不写 known_hosts、不修改任何文件，输出服务器 SSH 版本和需要在该 Host 段中补充的配置。把需要补充的配置展示给用户，由用户手动添加；不要自行编辑 ssh 配置，也不要加到 `Host *`。
+
 ## 禁止
 
 - 不直接运行 `ssh`/`scp`/`sshpass` 去连接需要密码的主机。
