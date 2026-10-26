@@ -19,6 +19,22 @@ zssh <alias> '<remote command>'
   - 下载：`zssh --get <alias> <remote path> <local path>`，属于只读操作，可直接执行。
   - 上传：`zssh --put <alias> <local path> <remote path>`，会创建或覆盖远程文件，属于变更操作，执行前先说明目标路径并等用户确认。
 
+## 日志检索
+
+只列容易导致漏查或误判的点：
+
+1. **“没找到”要有依据**：说明检索了哪些文件、哪个时间段。出现超时（`timeout` 退出码 `124`）、`Permission denied`/`权限不够`、`No such file`，或定位不到时间点时，该部分算**未检索**，不能算“没有”。管道最后一级的退出码会掩盖前面的错误，要同时看 stderr。
+2. **截断只放在管道最后一级**：`-m`、`head` 放在中间会漏掉后面的匹配。
+3. **多行日志按行号窗口检索**：Java 堆栈等续行没有时间戳，按时间前缀逐行过滤会漏掉。先用 `grep -n -m 1` 定位起止时间的行号，再 `sed -n 'a,bp'` 取出窗口后检索；精确时间点不存在时放宽前缀，或取到文件末尾（`$`）。
+4. **别忘了轮转日志**：事发时间早于当前文件开头时，同时检索 `*.1`、`*.gz` 等归档（`zgrep`）。
+5. **控制资源**：扫描大文件时加 `timeout <秒> nice -n 19 ionice -c3`；准备扫描的总量超过约 5GB 时先告知用户。
+
+```bash
+zssh web01 'f=/app/logs/app.log; a=$(grep -n -m 1 -F "2026-10-26 14:30" "$f" | cut -d: -f1); b=$(grep -n -m 1 -F "2026-10-26 14:40" "$f" | cut -d: -f1)
+  [ -n "$a" ] && [ -n "$b" ] || { echo "未定位到时间窗口 a=$a b=$b"; exit 3; }
+  sed -n "${a},${b}p" "$f" | grep -n -C 5 -F "OrderTimeoutException" | head -n 200'
+```
+
 ## 添加连接
 
 用户要求添加主机时可以执行 `zssh --add <alias> <user@host[:port]> </dev/null`：它只追加 `~/.ssh/config`，别名已存在会拒绝；无终端时自动跳过录入密码。之后请用户在自己的终端执行 `zssh --set <alias>` 录入密码（钥匙串/凭据管理器中的条目名为 `ssh_pass_<alias>`）。
