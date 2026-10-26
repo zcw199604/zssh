@@ -1,0 +1,109 @@
+#!/bin/sh
+# zssh：通过系统 ssh 执行远程命令，密码由 macOS 钥匙串直接交给 ssh（不经过参数、环境变量和输出）
+#   zssh <alias> '<remote command>'        在 ~/.ssh/config 中的主机别名上执行命令
+#   zssh --add <alias> <user@host[:port]>  在 ~/.ssh/config 追加主机别名，并可接着录入密码
+#   zssh --set <alias>                     录入/更新该别名的密码（交互输入，仅限人工在终端执行）
+set -eu
+
+# 钥匙串条目：service 为 ssh_pass_<alias>，account 为 alias
+SERVICE_PREFIX=ssh_pass_
+SECURITY=/usr/bin/security
+SSH_CONFIG="$HOME/.ssh/config"
+
+# 被 ssh 作为 SSH_ASKPASS 回调时：只应答密码提示，主机指纹确认等其他提示一律拒绝
+if [ -n "${ZSSH_ASKPASS_ALIAS:-}" ]; then
+    case "${1:-}" in
+        *assword*) exec "$SECURITY" find-generic-password -s "$SERVICE_PREFIX$ZSSH_ASKPASS_ALIAS" -a "$ZSSH_ASKPASS_ALIAS" -w ;;
+        *) exit 1 ;;
+    esac
+fi
+
+usage() {
+    sed -n '3,5p' "$0" >&2
+    exit 2
+}
+
+die() {
+    echo "zssh: $*" >&2
+    exit 1
+}
+
+check_alias() {
+    case "$1" in
+        '' | -* | *[!A-Za-z0-9._-]*) die "别名只能包含字母、数字、点、下划线和连字符，且不能以 - 开头: $1" ;;
+    esac
+}
+
+set_password() {
+    check_alias "$1"
+    exec "$SECURITY" add-generic-password -s "$SERVICE_PREFIX$1" -a "$1" -U -w
+}
+
+add_host() {
+    alias_name=$1
+    target=$2
+    check_alias "$alias_name"
+
+    case "$target" in
+        *@*) ;;
+        *) die "目标格式应为 user@host[:port]: $target" ;;
+    esac
+    user=${target%%@*}
+    host_port=${target#*@}
+    host=${host_port%%:*}
+    port=22
+    [ "$host_port" = "$host" ] || port=${host_port#*:}
+    case "$user" in '' | *[!A-Za-z0-9._-]*) die "用户名不合法: $user" ;; esac
+    case "$host" in '' | *[!A-Za-z0-9._-]*) die "主机地址不合法: $host" ;; esac
+    case "$port" in '' | *[!0-9]*) die "端口不合法: $port" ;; esac
+
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    if [ -f "$SSH_CONFIG" ] && awk -v a="$alias_name" '
+        tolower($1) == "host" { for (i = 2; i <= NF; i++) if ($i == a) found = 1 }
+        END { exit !found }' "$SSH_CONFIG"; then
+        die "别名已存在于 $SSH_CONFIG: $alias_name"
+    fi
+
+    touch "$SSH_CONFIG"
+    chmod 600 "$SSH_CONFIG"
+    printf '\nHost %s\n    HostName %s\n    User %s\n    Port %s\n' \
+        "$alias_name" "$host" "$user" "$port" >>"$SSH_CONFIG"
+    echo "已添加 Host $alias_name -> $user@$host:$port"
+
+    # 无终端（如被脚本调用）时读到 EOF，跳过录入密码
+    printf '是否为 %s 录入密码到钥匙串？密钥登录选 n [Y/n] ' "$alias_name"
+    read -r answer || { answer=n; echo; }
+    case "$answer" in
+        '' | [Yy]*) set_password "$alias_name" ;;
+        *) echo "已跳过；需要时执行: zssh --set $alias_name" ;;
+    esac
+}
+
+case "${1:-}" in
+    --set)
+        [ $# -eq 2 ] || usage
+        set_password "$2"
+        ;;
+    --add)
+        [ $# -eq 3 ] || usage
+        add_host "$2" "$3"
+        exit 0
+        ;;
+    '' | -*) usage ;;
+esac
+[ $# -ge 2 ] || usage
+
+alias_name=$1
+shift
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+set -- -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
+    -o ControlMaster=auto -o ControlPath="$HOME/.ssh/zssh-%C" -o ControlPersist=10m \
+    "$alias_name" "$@"
+
+# 钥匙串有该别名的密码 → askpass 方式；否则按密钥认证，且禁止任何交互提示
+if "$SECURITY" find-generic-password -s "$SERVICE_PREFIX$alias_name" -a "$alias_name" >/dev/null 2>&1; then
+    ZSSH_ASKPASS_ALIAS=$alias_name SSH_ASKPASS=$self SSH_ASKPASS_REQUIRE=force exec /usr/bin/ssh "$@"
+fi
+exec /usr/bin/ssh -o BatchMode=yes "$@"
